@@ -11,6 +11,18 @@
 #include <limits>
 #include <algorithm>
 
+#include <iostream>
+#include <iomanip>
+#include <x86intrin.h>
+#include <stdint.h>
+#include <stdlib.h>
+#include <unistd.h>
+#include <sys/time.h>
+#include <mkl_spblas.h>
+#include <mkl.h>
+#include <omp.h>
+#include <vector>
+
 namespace dgl {
 namespace aten {
 namespace cpu {
