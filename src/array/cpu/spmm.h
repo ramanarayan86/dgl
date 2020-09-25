@@ -25,6 +25,329 @@ namespace cpu {
  * \note it uses node parallel strategy, different threads are responsible
  *       for the computation of different nodes.
  */
+
+#if 1
+// // -----------------------------------------------------------------------------------
+// // ------------------------------ Optimized Sparse MM3 -------------------------------
+// // -----------------------------------------------------------------------------------
+template <typename IdType, typename DType, typename Op>
+// void sparse_mm3(
+  void SpMMSumCsr(
+    const BcastOff& bcast,
+    const CSRMatrix& csr,
+    NDArray ufeat, NDArray efeat,
+    NDArray out) {
+
+  const IdType* IndPtr = csr.indptr.Ptr<IdType>();
+  const IdType* Indices = csr.indices.Ptr<IdType>();
+  // const IdType* edges = csr.data.Ptr<IdType>();
+  
+  DType* C = out.Ptr<DType>();
+  DType* B = ufeat.Ptr<DType>();
+
+  if(sizeof(DType) == 8)
+    std::cout << "sizeof DType" << sizeof(DType) << " Sizeof IdType " << sizeof(IdType) << std::endl;
+
+
+  #define M_BLOCK_SIZE 1024
+  #define K_BLOCK_SIZE 4096
+  #define K_BLOCK_MASK (K_BLOCK_SIZE - 1)
+  #define N_BLOCK_SIZE 640
+  #define SORT 0
+    const int M = csr.num_rows;
+    const int N = bcast.out_len; //csr.N;
+    const int K = csr.num_cols;
+    int nthreads = omp_get_max_threads();
+
+    int32_t num_M_blocks = (M + M_BLOCK_SIZE - 1) / M_BLOCK_SIZE;
+    int32_t num_K_blocks = (K + K_BLOCK_SIZE - 1) / K_BLOCK_SIZE;
+
+    csrm block_csr_array[num_M_blocks * num_K_blocks];
+    //int *cur_col_id = (int *)_mm_malloc(2 * M_BLOCK_SIZE * sizeof(int), 64);
+
+    uint64_t startTick, endTick;
+    startTick = __rdtsc();
+    #pragma omp parallel
+    {
+        int *my_cur_col_id = (int *)_mm_malloc(2 * M_BLOCK_SIZE * sizeof(int), 64);
+        uint64_t tst = __rdtsc();
+         
+        int tid = omp_get_thread_num();     
+        #pragma omp for
+        for(int m = 0; m < num_M_blocks; m++)
+        {
+            int32_t M_start = m * M_BLOCK_SIZE;
+            int32_t M_end = (m + 1) * M_BLOCK_SIZE;
+            if(M_end > M) M_end = M;
+            int nnz = IndPtr[M_end] - IndPtr[M_start];
+            int32_t cur_indices_id = 0;
+            int32_t *indices = (int32_t *)_mm_malloc(nnz * sizeof(int32_t), 64);
+
+            for(int i = M_start; i < M_end; i++)
+            {
+                my_cur_col_id[(i - M_start) * 2] = IndPtr[i];
+                my_cur_col_id[(i - M_start) * 2 + 1] = IndPtr[i + 1];
+            }
+            for(int k = 0; k < num_K_blocks; k++)
+            {
+                int32_t K_start = k * K_BLOCK_SIZE;
+                int32_t K_end = (k + 1) * K_BLOCK_SIZE;
+                if(K_end > K) K_end = K;
+                csrm cur_csr;
+                cur_csr.M = M_end - M_start;
+                cur_csr.K = K_end - K_start;
+                cur_csr.N = N;
+                // Create csr_ij
+                int32_t *indptr = (int32_t *)_mm_malloc((cur_csr.M + 1) * sizeof(int32_t), 64);
+                cur_csr.indptr = indptr;
+                cur_csr.indices = indices + cur_indices_id;
+                cur_csr.values = NULL;
+                int cur_nnz = 0;
+                for(int i = M_start; i < M_end; i++)
+                {
+                    const int row_start = my_cur_col_id[(i - M_start) * 2];
+                    const int row_end   = my_cur_col_id[(i - M_start) * 2 + 1];
+                    indptr[i - M_start] = cur_nnz;
+                    int eid;
+                    for(eid = row_start; eid < row_end; eid++)
+                    {
+                        const int dst = Indices[eid];
+                        if(dst >= K_end)
+                        {
+                            break;
+                        }
+                        if(cur_indices_id + cur_nnz >= nnz)
+                        {
+                            printf("Error! cur_indices_id + cur_nnz = %d, nnz = %d\n", cur_indices_id + cur_nnz, nnz);
+                            exit(0);
+                        }
+                        indices[cur_indices_id + cur_nnz] = dst;
+                        cur_nnz++;
+                    }
+                    my_cur_col_id[(i - M_start) * 2] = eid;
+                }
+                indptr[cur_csr.M] = cur_nnz;
+                cur_indices_id += cur_nnz;
+                block_csr_array[m * num_K_blocks + k] = cur_csr;
+
+            }
+            if(nnz != cur_indices_id)
+            {
+                printf("cur_indices_id = %d, expected = %d\n", cur_indices_id, nnz);
+                exit(0);
+            }
+        }
+        _mm_free(my_cur_col_id);
+        uint64_t tend = __rdtsc();
+        // printf("%d] %lu\n", tid, tend - tst);
+    }
+    endTick = __rdtsc();
+    // printf("stage 1: %lu\n", endTick - startTick);
+    // int nnz_ = static_cast<int32_t*>(csr.indptr)[M];
+    int nnz_ = static_cast<const IdType*>(IndPtr)[M];
+
+    #if VER
+    fprintf(stderr, "nthreads: %d, M: %d, K: %d, N: %d, nzz: %d\n",
+            nthreads, M, K, N, nnz_);
+    #endif
+    
+    // #if FILEIO
+    // static int cnt = 0;
+    // if (N > 600) {
+    //     cnt ++;
+    //     FILE *fp = fopen("csr.txt", "a");
+    //     fwrite(&M, sizeof(int32_t), 1, fp);
+    //     fwrite(&K, sizeof(int32_t), 1, fp);
+    //     fwrite(&N, sizeof(int32_t), 1, fp);
+    //     fwrite(static_cast<int32_t*>(csr.indptr->data), sizeof(int32_t), M+1, fp);
+    //     fwrite(static_cast<int32_t*>(csr.indices->data), sizeof(int32_t), nnz_, fp);
+    //     fclose(fp);
+    // }
+    // if (cnt == 300)
+    //     exit(0);
+    // #endif
+   
+#define PFD 160
+    startTick = __rdtsc();
+    int32_t N_block_start = 0;
+    int32_t N_block_end = N;
+    int rem = (N_block_end - N_block_start) & 0xf;
+    __mmask16 mask = (1 << rem) - 1;
+    __m512 zero512 = _mm512_setzero_ps();
+#pragma omp parallel
+    {
+        int tid = omp_get_thread_num();     
+        uint64_t tst = __rdtsc();
+        for(int32_t k = 0; k < num_K_blocks; k++)
+        {
+#pragma omp for schedule(dynamic)
+            for(int32_t m = 0; m < num_M_blocks; m++)
+            {
+                //printf("m = %d\n", m);
+                csrm cur_csr = block_csr_array[m * num_K_blocks + k];
+
+                int32_t cur_M = cur_csr.M;
+                int32_t cur_K = cur_csr.K;
+                int32_t cur_N = cur_csr.N;
+
+                int32_t M_start = m * M_BLOCK_SIZE;
+                for(int i = 0; i < cur_M; i++)
+                {
+                    const int row_start = cur_csr.indptr[i];
+                    const int row_end   = cur_csr.indptr[i + 1];
+                    int32_t src = i + M_start;
+
+                    int32_t eid;
+                    for(eid = row_start; eid < (row_end - 4); eid+=4)
+                    {
+                        int j;
+                        DType *Bptr0 = &B[cur_csr.indices[eid] * N + N_block_start];
+                        DType *Bptr1 = &B[cur_csr.indices[eid + 1] * N + N_block_start];
+                        DType *Bptr2 = &B[cur_csr.indices[eid + 2] * N + N_block_start];
+                        DType *Bptr3 = &B[cur_csr.indices[eid + 3] * N + N_block_start];
+                        DType *B_next_ptr0 = &B[cur_csr.indices[eid + 4] * N + N_block_start];
+                        DType *B_next_ptr1 = &B[cur_csr.indices[eid + 5] * N + N_block_start];
+                        DType *B_next_ptr2 = &B[cur_csr.indices[eid + 6] * N + N_block_start];
+                        DType *B_next_ptr3 = &B[cur_csr.indices[eid + 7] * N + N_block_start];
+                        DType *Cptr = &C[src * N + N_block_start];
+#pragma unroll(16)
+                        for(j = N_block_start; j < N_block_end - PFD; j += 16)
+                        {
+                            _mm_prefetch((const char *)(Bptr0 + PFD), _MM_HINT_T0);
+                            _mm_prefetch((const char *)(Bptr1 + PFD), _MM_HINT_T0);
+                            _mm_prefetch((const char *)(Bptr2 + PFD), _MM_HINT_T0);
+                            _mm_prefetch((const char *)(Bptr3 + PFD), _MM_HINT_T0);
+                            //B_next_ptr0 += 16;
+                            //B_next_ptr1 += 16;
+                            //B_next_ptr2 += 16;
+                            //B_next_ptr3 += 16;
+                            __m512 c512 = _mm512_loadu_ps(Cptr);
+                            Cptr += 16;
+                            c512 = _mm512_add_ps(_mm512_loadu_ps(Bptr0), c512);
+                            c512 = _mm512_add_ps(_mm512_loadu_ps(Bptr1), c512);
+                            c512 = _mm512_add_ps(_mm512_loadu_ps(Bptr2), c512);
+                            c512 = _mm512_add_ps(_mm512_loadu_ps(Bptr3), c512);
+                            Bptr0 += 16;
+                            Bptr1 += 16;
+                            Bptr2 += 16;
+                            Bptr3 += 16;
+                            _mm512_storeu_ps(&C[src * N + j], c512);
+                        }
+#pragma unroll(16)
+                        for(; j < N_block_end - 15; j += 16)
+                        {
+                            _mm_prefetch((const char *)(B_next_ptr0), _MM_HINT_T0);
+                            _mm_prefetch((const char *)(B_next_ptr1), _MM_HINT_T0);
+                            _mm_prefetch((const char *)(B_next_ptr2), _MM_HINT_T0);
+                            _mm_prefetch((const char *)(B_next_ptr3), _MM_HINT_T0);
+                            B_next_ptr0 += 16;
+                            B_next_ptr1 += 16;
+                            B_next_ptr2 += 16;
+                            B_next_ptr3 += 16;
+                            __m512 c512 = _mm512_loadu_ps(Cptr);
+                            Cptr += 16;
+                            c512 = _mm512_add_ps(_mm512_loadu_ps(Bptr0), c512);
+                            c512 = _mm512_add_ps(_mm512_loadu_ps(Bptr1), c512);
+                            c512 = _mm512_add_ps(_mm512_loadu_ps(Bptr2), c512);
+                            c512 = _mm512_add_ps(_mm512_loadu_ps(Bptr3), c512);
+                            Bptr0 += 16;
+                            Bptr1 += 16;
+                            Bptr2 += 16;
+                            Bptr3 += 16;
+                            _mm512_storeu_ps(&C[src * N + j], c512);
+                        }
+                        __m512 c512 = _mm512_mask_loadu_ps(zero512, mask, &C[src * N + j]);
+                        c512 = _mm512_add_ps(_mm512_mask_loadu_ps(zero512, mask, Bptr0), c512);
+                        c512 = _mm512_add_ps(_mm512_mask_loadu_ps(zero512, mask, Bptr1), c512);
+                        c512 = _mm512_add_ps(_mm512_mask_loadu_ps(zero512, mask, Bptr2), c512);
+                        c512 = _mm512_add_ps(_mm512_mask_loadu_ps(zero512, mask, Bptr3), c512);
+                        _mm512_mask_storeu_ps(&C[src * N + j], mask, c512);
+                    }
+                    for(; eid < (row_end - 1); eid++)
+                    {
+                        int32_t dst = cur_csr.indices[eid];
+                        int32_t dst_next = cur_csr.indices[eid + 1];
+                        int j;
+                        DType *Bptr = &B[dst * N + N_block_start];
+                        DType *B_next_ptr = &B[dst_next * N + N_block_start];
+                        DType *Cptr = &C[src * N + N_block_start];
+#pragma unroll(16)
+                        for(j = N_block_start; j < N_block_end - 15; j += 16)
+                        {
+                            _mm_prefetch((const char *)(B_next_ptr), _MM_HINT_T0);
+                            B_next_ptr += 16;
+                            __m512 c512 = _mm512_loadu_ps(Cptr);
+                            Cptr += 16;
+                            c512 = _mm512_add_ps(_mm512_loadu_ps(Bptr), c512);
+                            Bptr += 16;
+                            _mm512_storeu_ps(&C[src * N + j], c512);
+                            // if (N < 602)
+                            //     std::cout << " Check eid " << N << std::endl;
+                        }
+                        // if (N < 602)
+                        // {    std::cout << " Start loop --- outer " << N << std::endl;
+                        //     std::cout << " Start Block " << N_block_start << std::endl;
+                        //     std::cout << " End Block " << N_block_end << std::endl;
+                        // }
+                        __m512 c512 = _mm512_mask_loadu_ps(zero512, mask, &C[src * N + j]);
+                        c512 = _mm512_add_ps(_mm512_mask_loadu_ps(zero512, mask, Bptr), c512);
+                        _mm512_mask_storeu_ps(&C[src * N + j], mask, c512);
+                        
+                    }
+                    for(; eid < row_end; eid++)
+                    {
+                        int32_t src_next = src + 1;
+                        int32_t dst = cur_csr.indices[eid];
+                        int32_t dst_next = cur_csr.indices[eid + 1];
+                        DType *Bptr = &B[dst * N + N_block_start];
+                        DType *B_next_ptr = &B[dst_next * N + N_block_start];
+                        DType *Cptr = &C[src * N + N_block_start];
+                        DType *C_next_ptr = &C[src_next * N + N_block_start];
+                        int j;
+#pragma unroll(16)
+                        for(j = N_block_start; j < N_block_end - 15; j += 16)
+                        {
+                            _mm_prefetch((const char *)(C_next_ptr), _MM_HINT_T0);
+                            C_next_ptr += 16;
+                            _mm_prefetch((const char *)(B_next_ptr), _MM_HINT_T0);
+                            B_next_ptr += 16;
+                            __m512 c512 = _mm512_loadu_ps(Cptr);
+                            Cptr += 16;
+                            c512 = _mm512_add_ps(_mm512_loadu_ps(Bptr), c512);
+                            Bptr += 16;
+                            _mm512_storeu_ps(&C[src * N + j], c512);
+                        }
+                        __m512 c512 = _mm512_mask_loadu_ps(zero512, mask, &C[src * N + j]);
+                        c512 = _mm512_add_ps(_mm512_mask_loadu_ps(zero512, mask, Bptr), c512);
+                        _mm512_mask_storeu_ps(&C[src * N + j], mask, c512);
+                    }
+                }
+            }
+        }
+        uint64_t tend = __rdtsc();
+        // printf("%d] %lu\n", tid, tend - tst);
+    }
+    endTick = __rdtsc();
+    // printf("stage2 ticks = %ld\n", endTick - startTick);
+
+    for(int m = 0; m < num_M_blocks; m++)
+    {
+        for(int k = 0; k < num_K_blocks; k++)
+        {
+            _mm_free(block_csr_array[m * num_K_blocks + k].indptr);
+        }
+        _mm_free(block_csr_array[m * num_K_blocks].indices);
+    }
+    #undef K_BLOCK_SIZE
+    #undef K_BLOCK_MASK
+    #undef N_BLOCK_SIZE
+    #undef SORT    
+}
+
+#else
+// // -------------------------------------------------------------------------------------------------
+// // --------------------------------------- Default SpMMSumCsr --------------------------------------
+// // -------------------------------------------------------------------------------------------------
 template <typename IdType, typename DType, typename Op>
 void SpMMSumCsr(
     const BcastOff& bcast,
@@ -61,7 +384,7 @@ void SpMMSumCsr(
     }
   }
 }
-
+#endif
 /*!
  * \brief CPU kernel of SpMM on Coo format.
  * \param bcast Broadcast information.
