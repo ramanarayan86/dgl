@@ -15,6 +15,12 @@ namespace dgl {
 namespace aten {
 namespace cpu {
 
+typedef struct {
+    int32_t M, K, N;
+    int32_t *indptr, *indices;
+    float *values;
+} csrm;
+
 /*!
  * \brief CPU kernel of SpMM on Csr format.
  * \param bcast Broadcast information.
