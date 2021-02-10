@@ -18,7 +18,7 @@ class SAGEConvAgg(nn.Module):
         super(SAGEConvAgg, self).__init__()
 
         self._in_src_feats, self._in_dst_feats = expand_as_pair(in_feats)
-        # self._out_feats = out_feats
+       
         self._aggre_type = aggregator_type
               
     
@@ -97,7 +97,7 @@ class SAGEConvAgg(nn.Module):
             else:
                 raise KeyError('Aggregator type {} not recognized.'.format(self._aggre_type))
         
-            return h_self, h_neigh
+            return h_neigh
 
 
 class SAGEConvMLP(nn.Module):
@@ -114,10 +114,11 @@ class SAGEConvMLP(nn.Module):
 
         self._in_src_feats, self._in_dst_feats = expand_as_pair(in_feats)
         self._out_feats = out_feats
-        # self._aggre_type = aggregator_type
+        self._aggre_type = aggregator_type
         self.norm = norm
         self.feat_drop = nn.Dropout(feat_drop)
         self.activation = activation
+
         # aggregator type: mean/pool/lstm/gcn
         if aggregator_type == 'pool':
             self.fc_pool = nn.Linear(self._in_src_feats, self._in_src_feats)
@@ -149,7 +150,7 @@ class SAGEConvMLP(nn.Module):
             nn.init.xavier_uniform_(self.fc_self.weight, gain=gain)
         nn.init.xavier_uniform_(self.fc_neigh.weight, gain=gain)
 
-    def forward(self, graph, feat):
+    def forward(self, graph, feat, h_neigh):
         r"""
 
         Description

@@ -14,7 +14,8 @@ import torch.nn.functional as F
 import dgl
 from dgl import DGLGraph
 from dgl.data import register_data_args, load_data
-from dgl.nn.pytorch.conv import SAGEConvAgg, SAGEConvMLP
+#from dgl.nn.pytorch.conv import SAGEConvAgg, SAGEConvMLP
+from sageconv import SAGEConvAgg, SAGEConvMLP
 
 
 def broad_func( self, graph, ampbyp, agg, inputs):
