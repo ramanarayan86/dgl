@@ -107,12 +107,12 @@ class GraphSAGE(nn.Module):
     self.agg_layers.append(SAGEConvAgg(n_hidden, aggregator_type)) # activation None
 
     # input layer
-    self.mlp_layers.append(SAGEConvMLP(in_feats, n_hidden))
+    self.mlp_layers.append(SAGEConvMLP(in_feats, n_hidden, aggregator_type))
     # hidden layers
     for i in range(n_layers - 1):
-        self.mlp_layers.append(SAGEConvMLP(n_hidden, n_hidden))
+        self.mlp_layers.append(SAGEConvMLP(n_hidden, n_hidden, aggregator_type))
     # output layer
-    self.mlp_layers.append(SAGEConvMLP(n_hidden, n_classes)) # activation None
+    self.mlp_layers.append(SAGEConvMLP(n_hidden, n_classes, aggregator_type)) # activation None
 
   def forward(self, graph, inputs):
     h = self.dropout(inputs)
