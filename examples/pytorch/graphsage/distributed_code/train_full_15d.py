@@ -5,10 +5,12 @@ Code: https://github.com/williamleif/graphsage-simple
 Simple reference implementation of GraphSAGE.
 """
 import argparse
+import os
 import time
 import numpy as np
 import networkx as nx
 import torch
+import torch.distributed as dist
 import torch.nn as nn
 import torch.nn.functional as F
 import dgl
@@ -54,6 +56,27 @@ def broad_func( self, graph, ampbyp, agg, inputs):
 
   return z_loc
 
+def get_proc_groups(rank, size, replication):
+    rank_c = rank // replication
+     
+    row_procs = []
+    for i in range(0, size, replication):
+        row_procs.append(list(range(i, i + replication)))
+
+    col_procs = []
+    for i in range(replication):
+        col_procs.append(list(range(i, size, replication)))
+
+    row_groups = []
+    for i in range(len(row_procs)):
+        row_groups.append(dist.new_group(row_procs[i]))
+
+    col_groups = []
+    for i in range(len(col_procs)):
+        col_groups.append(dist.new_group(col_procs[i]))
+
+    return row_groups, col_groups
+
 class GraphSAGEFn(torch.autograd.Function):
   @staticmethod
   def forward(ctx, self, graph, ampbyp, agg, mlp, inputs):
@@ -70,7 +93,7 @@ class GraphSAGEFn(torch.autograd.Function):
 
     return z
 
-  @staticemthod
+  @staticmethod
   def backward(ctx, grad_output):
     self = ctx.self 
     graph = ctx.graph
@@ -176,14 +199,38 @@ def main(args):
     if cuda:
         g = g.int().to(args.gpu)
 
+    # Initialize distributed environment
+    if "SLURM_PROCID" in os.environ.keys():
+        os.environ["RANK"] = os.environ["SLURM_PROCID"]
+
+    if "SLURM_NTASKS" in os.environ.keys():
+        os.environ["WORLD_SIZE"] = os.environ["SLURM_NTASKS"]
+
+    os.environ["MASTER_ADDR"] = "127.0.0.1" # TODO: Change when moving to distributed settings
+    os.environ["MASTER_PORT"] = "1234"
+    dist.init_process_group(backend='gloo')
+    rank = dist.get_rank()
+    size = dist.get_world_size()
+    print(f"rank: {rank} size: {size}")
+
+    group = dist.new_group(list(range(size)))
+    row_groups, col_groups = get_proc_groups(rank, size, args.replication)
+
     # create GraphSAGE model
+    # def __init__(self, in_feats, n_hidden, n_classes, n_layers, activation, dropout, aggregator_type, rank, size, replication, group, row_groups, col_groups):
     model = GraphSAGE(in_feats,
                       args.n_hidden,
                       n_classes,
                       args.n_layers,
                       F.relu,
                       args.dropout,
-                      args.aggregator_type)
+                      args.aggregator_type,
+                      rank,
+                      size,
+                      args.replication,
+                      group,
+                      row_groups,
+                      col_groups)
 
     if cuda:
         model.cuda()
@@ -237,6 +284,8 @@ if __name__ == '__main__':
                         help="Weight for L2 loss")
     parser.add_argument("--aggregator-type", type=str, default="gcn",
                         help="Aggregator type: mean/gcn/pool/lstm")
+    parser.add_argument("--replication", type=int, default=1,
+                        help="replciation factor for 1.5D algorithm")
     args = parser.parse_args()
     print(args)
 
