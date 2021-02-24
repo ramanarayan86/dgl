@@ -19,15 +19,17 @@ from dgl import DGLGraph
 from dgl.data import register_data_args, load_data
 #from dgl.nn.pytorch.conv import SAGEConvAgg, SAGEConvMLP
 from sageconv import SAGEConvAgg, SAGEConvMLP
+# import torch_ccl
 
 
 def broad_func(self, graph, ampbyp, agg, inputs):
   node_count = graph.number_of_nodes()
-
-  n_per_proc = math.ceil(float(node_count) / (size / replication))
-  z_loc = torch.FloatTensor(am_pbyp[0].size(0), inputs.size(1)).fill_(0)
+#   print('---------',inputs.shape[1], ampbyp)
+  n_per_proc = math.ceil(float(node_count) / (self.size / self.replication))
+  z_loc = torch.FloatTensor(ampbyp[0].size(0), inputs.size(1)).fill_(0)
   inputs_recv = torch.FloatTensor(n_per_proc, inputs.size(1)).fill_(0)
   
+ 
   rank_c = self.rank // self.replication
   rank_col = self.rank % self.replication
 
@@ -42,18 +44,20 @@ def broad_func(self, graph, ampbyp, agg, inputs):
     q = (rank_col * chunk)*self.replication + i*self.replication + rank_col
     q_c = (rank_col * chunk) + i
 
-    if q == rank:
+    if q == self.rank:
       inputs_recv = inputs.clone()
-    elif q_c == size // replication - 1:
+    elif q_c == self.size // self.replication - 1:
       inputs_recv = torch.FloatTensor(am_pbyp[q_c].size(1), inputs.size(1)).fill_(0)
 
     inputs_recv = inputs_recv.contiguous()
+    print("==================inp ",inputs_recv.shape)
+    print("========= col ", q , self.col_groups[rank_col])
     dist.broadcast(inputs_recv, src=q, group=self.col_groups[rank_col])
     
     z_loc = agg(graph, inputs_recv)
   
   z_loc = z_loc.contiguous()
-  dist.all_reduce(z_loc, op=dist.reduce_op.SUM, group=row_groups[rank_c])
+  dist.all_reduce(z_loc, op=dist.reduce_op.SUM, group=self.row_groups[rank_c])
 
   return z_loc
 
@@ -83,7 +87,7 @@ class GraphSAGEFn(torch.autograd.Function):
   def forward(ctx, self, graph, ampbyp, agg, mlp, inputs):
 
     z = broad_func(self, graph, ampbyp, agg, inputs)
-    z = mlp(z)
+    z = mlp(graph, z, z)
 
     ctx.save_for_backward(ampbyp, inputs)
     ctx.graph = graph
@@ -248,10 +252,10 @@ def oned_partition(rank, size, replication, inputs, adj_matrix, normalization):
     return inputs_loc, adj_matrix_loc, am_pbyp
 
 
-def evaluate(model, graph, features, labels, nid):
+def evaluate(model, graph, features, labels, nid, ampbyp):
     model.eval()
     with torch.no_grad():
-        logits = model(graph, features)
+        logits = model(graph, features, ampbyp)
         logits = logits[nid]
         labels = labels[nid]
         _, indices = torch.max(logits, dim=1)
@@ -304,18 +308,42 @@ def main(args):
         g = g.int().to(args.gpu)
 
     # Initialize distributed environment
-    if "SLURM_PROCID" in os.environ.keys():
-        os.environ["RANK"] = os.environ["SLURM_PROCID"]
+    # if "SLURM_PROCID" in os.environ.keys():
+    #     os.environ["RANK"] = os.environ["SLURM_PROCID"]
 
-    if "SLURM_NTASKS" in os.environ.keys():
-        os.environ["WORLD_SIZE"] = os.environ["SLURM_NTASKS"]
+    # if "SLURM_NTASKS" in os.environ.keys():
+    #     os.environ["WORLD_SIZE"] = os.environ["SLURM_NTASKS"]
 
-    os.environ["MASTER_ADDR"] = "127.0.0.1" # TODO: Change when moving to distributed settings
-    os.environ["MASTER_PORT"] = "1234"
-    dist.init_process_group(backend='gloo')
-    rank = dist.get_rank()
-    size = dist.get_world_size()
-    print(f"rank: {rank} size: {size}")
+    # os.environ["MASTER_ADDR"] = "127.0.0.1" # TODO: Change when moving to distributed settings
+    # os.environ["MASTER_PORT"] = "1234"
+
+    # dist.init_process_group(backend=args.dist_backend, init_method=args.dist_url,
+    #                             world_size=args.world_size, rank=args.rank) 
+
+    # dist.init_process_group(backend='mpi')
+    # rank = dist.get_rank()
+    # size = dist.get_world_size()
+    # print(f"rank: {rank} size: {size}")
+
+
+    # if args.dist_url == "env://" and args.world_size == -1:
+    #     args.world_size = int(os.environ.get("PMI_SIZE", -1))
+    # if args.world_size == -1: args.world_size = int(os.environ["WORLD_SIZE"])
+
+    # args.distributed = args.world_size > 1
+    # if args.distributed:
+    #     args.rank = int(os.environ.get("PMI_RANK", -1))
+    #     if args.rank == -1: args.rank = int(os.environ["RANK"])        
+    #     dist.init_process_group(backend=args.dist_backend, init_method=args.dist_url,
+    #                             world_size=args.world_size, rank=args.rank)
+
+    #     print("Rank: ", args.rank ," World_size: ", args.world_size)
+
+    rank = args.rank
+    size = args.world_size
+
+    print("Processes: " + str(size))
+    device = torch.device('cpu')
 
     group = dist.new_group(list(range(size)))
     row_groups, col_groups = get_proc_groups(rank, size, args.replication)
@@ -325,12 +353,16 @@ def main(args):
     edges = torch.stack([edges[0], edges[1]], dim=0)
     features_loc, g_loc, ampbyp = oned_partition(rank, size, args.replication, features, edges, 
                                                         args.normalization)
-
+    # print("------------------->",ampbyp)
     # Convert COO back to DGLGraph
     # Uses hardcoded types, doesn't include all the metadata in original g
     g_loc = dgl.heterograph({("_N", "_N", "_E"): (g_loc._indices()[0], g_loc._indices()[1])}) 
+    # for i in range(len(ampbyp)):
+    #     ampbyp[i] = dgl.heterograph({("_N", "_N", "_E"): (ampbyp[i]._indices()[0], ampbyp[i]._indices()[1])})
+
     for i in range(len(ampbyp)):
-        ampbyp[i] = dgl.heterograph({("_N", "_N", "_E"): (ampbyp[i]._indices()[0], ampbyp[i]._indices()[1])})
+        ampbyp[i] = ampbyp[i].t().coalesce().to(device)
+        # ampbyp[i] = dgl.heterograph({am_pbyp[i]})
 
     # create GraphSAGE model
     model = GraphSAGE(in_feats,
@@ -361,22 +393,51 @@ def main(args):
             t0 = time.time()
         # forward
         logits = model(g, features, ampbyp)
-        loss = F.cross_entropy(logits[train_nid], labels[train_nid])
+        
+        print("replication:   ", args)
+        rank_c = rank // args.replication
+        var = logits.size(0)
+        rank_train_mask = torch.split(train_mask, logits.size(0), dim=0)[rank_c]
+        rank_val_mask = torch.split(val_mask, logits.size(0), dim=0)[rank_c]
+        label_rank = torch.split(labels, logits.size(0), dim=0)[rank_c]
+        train_nids= rank_train_mask.nonzero().squeeze()
+        val_nids = rank_val_mask.nonzero().squeeze()
 
+        print("train_mask ==========", train_mask.shape)
+        print("labl =============", labels.dtype)
+        print("rank_train_mask ===========", train_nids.dtype)
+        print("label_rank =============", label_rank.dtype)
+        print("labels ------>",label_rank[rank_train_mask].size()) #, " ", labels[train_nid].shape)
+        print("logits ------>",logits[rank_train_mask].size())
+         
+        # if list(label_rank[rank_train_mask].size())[0] > 0:
+        # loss = F.cross_entropy(logits[rank_train_mask], label_rank[rank_train_mask]) 
+        # for param in model.parameters(): param.requires_grad = True 
+        # for param in model.parameters(): param.requires_grad=True
+        loss = F.cross_entropy(logits[train_nids], label_rank[train_nids]) 
+        # loss = Variable(loss, requires_grad = True)
+        loss.requires_grad = True
+        print("-----------",loss.dtype)
         optimizer.zero_grad()
         loss.backward()
+        print("back loss ---")
+        # else:
+        #     fake_loss = (logits * torch.FloatTensor(logits.size(), device=device).fill_(0)).sum()
+        #     fake_loss.backward()
         optimizer.step()
 
         if epoch >= 3:
             dur.append(time.time() - t0)
 
-        acc = evaluate(model, g, features, labels, val_nid)
+        acc = evaluate(model, g, features, labels, val_nids, ampbyp)
         print("Epoch {:05d} | Time(s) {:.4f} | Loss {:.4f} | Accuracy {:.4f} | "
               "ETputs(KTEPS) {:.2f}".format(epoch, np.mean(dur), loss.item(),
                                             acc, n_edges / np.mean(dur) / 1000))
 
+    rank_test_mask = torch.split(test_mask, logits.size(0), dim=0)[rank_c]
+    test_nids = rank_test_mask.nonzero().squeeze()
     print()
-    acc = evaluate(model, g, features, labels, test_nid)
+    acc = evaluate(model, g, features, labels, test_nids, ampbyp)
     print("Test Accuracy {:.4f}".format(acc))
 
 
@@ -403,7 +464,34 @@ if __name__ == '__main__':
                         help="replciation factor for 1.5D algorithm")
     parser.add_argument("--normalization", type=bool, default=False,
                         help="normalize adjacency matrix for training")
+    parser.add_argument('--world-size', default=-1, type=int,
+                         help='number of nodes for distributed training')
+    parser.add_argument('--rank', default=-1, type=int,
+                         help='node rank for distributed training')
+    parser.add_argument('--dist-url', default='env://', type=str,
+                         help='url used to set up distributed training')
+    parser.add_argument('--dist-backend', default='gloo', type=str,
+                            help='distributed backend')
     args = parser.parse_args()
     print(args)
+
+    if args.dist_url == "env://" and args.world_size == -1:
+        args.world_size = int(os.environ.get("PMI_SIZE", -1))
+        if args.world_size == -1: args.world_size = int(os.environ["WORLD_SIZE"])
+
+    args.distributed = args.world_size > 1
+    if args.distributed:
+        args.rank = int(os.environ.get("PMI_RANK", -1))
+        if args.rank == -1: args.rank = int(os.environ["RANK"])        
+        dist.init_process_group(backend=args.dist_backend, init_method=args.dist_url,
+                                world_size=args.world_size, rank=args.rank)
+
+    print("Rank: ", args.rank ," World_size: ", args.world_size)
+
+    # rank = args.rank
+    # size = args.world_size
+
+    # print("Processes: " + str(size))
+    # device = torch.device('cpu')
 
     main(args)
