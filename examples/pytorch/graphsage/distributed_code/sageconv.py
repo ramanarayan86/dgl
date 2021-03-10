@@ -63,7 +63,9 @@ class SAGEConvAgg(nn.Module):
                 feat_src = self.feat_drop(feat[0])
                 feat_dst = self.feat_drop(feat[1])
             else:
-                feat_src = feat_dst = self.feat_drop(feat)
+                # No dropout in aggregation
+                # feat_src = feat_dst = self.feat_drop(feat)
+                feat_src = feat_dst = feat 
                 if graph.is_block:
                     feat_dst = feat_src[:graph.number_of_dst_nodes()]
 

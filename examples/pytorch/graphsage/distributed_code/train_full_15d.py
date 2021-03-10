@@ -21,6 +21,8 @@ from dgl.data import register_data_args, load_data
 from sageconv import SAGEConvAgg, SAGEConvMLP
 # import torch_ccl
 
+import socket
+
 
 def broad_func(self, graph, ampbyp, agg, inputs):
   node_count = graph.number_of_nodes()
@@ -36,7 +38,9 @@ def broad_func(self, graph, ampbyp, agg, inputs):
   stages = self.size // (self.replication ** 2)
 
   if rank_col == self.replication - 1:
-    stages = rank_c - (self.replication - 1) * stages
+    # stages = rank_c - (self.replication - 1) * stages
+    stages = (self.size // self.replication) - (self.replication - 1) * stages
+
   
   chunk = self.size // (self.replication ** 2)
 
@@ -50,8 +54,8 @@ def broad_func(self, graph, ampbyp, agg, inputs):
       inputs_recv = torch.FloatTensor(am_pbyp[q_c].size(1), inputs.size(1)).fill_(0)
 
     inputs_recv = inputs_recv.contiguous()
-    print("==================inp ",inputs_recv.shape)
-    print("========= col ", q , self.col_groups[rank_col])
+    # print("==================inp ",inputs_recv.shape)
+    # print("========= col ", q , self.col_groups[rank_col])
     dist.broadcast(inputs_recv, src=q, group=self.col_groups[rank_col])
     
     z_loc = agg(graph, inputs_recv)
@@ -89,7 +93,8 @@ class GraphSAGEFn(torch.autograd.Function):
     z = broad_func(self, graph, ampbyp, agg, inputs)
     z = mlp(graph, z, z)
 
-    ctx.save_for_backward(ampbyp, inputs)
+    ctx.save_for_backward(inputs)
+    ctx.ampbyp = ampbyp
     ctx.graph = graph
     ctx.self = self
     ctx.agg = agg
@@ -105,12 +110,22 @@ class GraphSAGEFn(torch.autograd.Function):
     agg = ctx.agg
     mlp = ctx.mlp
     z = ctx.z
-    ampbyp, inputs = ctx.saved_tensors
+    ampbyp = ctx.ampbyp
+    inputs = ctx.saved_tensors
     
-    t_grad_input, grad_weight, grad_bias = mlp(grad_output)
-    dz = broad_func(self, graph, ampbyp, agg, t_grad_input)
+    # t_grad_input, grad_weight, grad_bias = mlp(grad_output)
+    # dz = broad_func(self, graph, ampbyp, agg, t_grad_input)
     
-    return None, dz, grad_weight, grad_bias, None, None
+    # t_grad_input = mlp(graph, grad_output, grad_output)
+    # grad_output = mlp(graph, grad_output, grad_output)
+    weight = mlp.fc_neigh.weight.data
+    bias = mlp.fc_neigh.bias
+    # grad_output = torch.addmm(bias, grad_output, weight)
+    grad_output = torch.mm(grad_output, weight)
+    dz = broad_func(self, graph, ampbyp, agg, grad_output)
+
+    return None, None, None, None, None, dz
+
 
 class GraphSAGE(nn.Module):
   def __init__(self, in_feats, n_hidden, n_classes, n_layers, activation, dropout, aggregator_type, rank, size, replication, group, row_groups, col_groups):
@@ -307,24 +322,25 @@ def main(args):
     if cuda:
         g = g.int().to(args.gpu)
 
-    # Initialize distributed environment
-    # if "SLURM_PROCID" in os.environ.keys():
-    #     os.environ["RANK"] = os.environ["SLURM_PROCID"]
+    # Initialize distributed environment with SLURM
+    if "SLURM_PROCID" in os.environ.keys():
+        os.environ["RANK"] = os.environ["SLURM_PROCID"]
 
-    # if "SLURM_NTASKS" in os.environ.keys():
-    #     os.environ["WORLD_SIZE"] = os.environ["SLURM_NTASKS"]
+    if "SLURM_NTASKS" in os.environ.keys():
+        os.environ["WORLD_SIZE"] = os.environ["SLURM_NTASKS"]
 
-    # os.environ["MASTER_ADDR"] = "127.0.0.1" # TODO: Change when moving to distributed settings
-    # os.environ["MASTER_PORT"] = "1234"
+    print(f"hostname: {socket.gethostname()}", flush=True)
+    os.environ["MASTER_ADDR"] = args.hostname 
+    os.environ["MASTER_PORT"] = "1234"
 
     # dist.init_process_group(backend=args.dist_backend, init_method=args.dist_url,
     #                             world_size=args.world_size, rank=args.rank) 
 
     # dist.init_process_group(backend='mpi')
-    # rank = dist.get_rank()
-    # size = dist.get_world_size()
-    # print(f"rank: {rank} size: {size}")
-
+    dist.init_process_group(backend='gloo')
+    rank = dist.get_rank()
+    size = dist.get_world_size()
+    print(f"hostname: {socket.gethostname()} rank: {rank} size: {size}")
 
     # if args.dist_url == "env://" and args.world_size == -1:
     #     args.world_size = int(os.environ.get("PMI_SIZE", -1))
@@ -339,8 +355,8 @@ def main(args):
 
     #     print("Rank: ", args.rank ," World_size: ", args.world_size)
 
-    rank = args.rank
-    size = args.world_size
+    # rank = args.rank
+    # size = args.world_size
 
     print("Processes: " + str(size))
     device = torch.device('cpu')
@@ -364,6 +380,7 @@ def main(args):
         ampbyp[i] = ampbyp[i].t().coalesce().to(device)
         # ampbyp[i] = dgl.heterograph({am_pbyp[i]})
 
+    features.requires_grad = True
     # create GraphSAGE model
     model = GraphSAGE(in_feats,
                       args.n_hidden,
@@ -394,7 +411,6 @@ def main(args):
         # forward
         logits = model(g, features, ampbyp)
         
-        print("replication:   ", args)
         rank_c = rank // args.replication
         var = logits.size(0)
         rank_train_mask = torch.split(train_mask, logits.size(0), dim=0)[rank_c]
@@ -416,11 +432,9 @@ def main(args):
         # for param in model.parameters(): param.requires_grad=True
         loss = F.cross_entropy(logits[train_nids], label_rank[train_nids]) 
         # loss = Variable(loss, requires_grad = True)
-        loss.requires_grad = True
-        print("-----------",loss.dtype)
+        # loss.requires_grad = True
         optimizer.zero_grad()
         loss.backward()
-        print("back loss ---")
         # else:
         #     fake_loss = (logits * torch.FloatTensor(logits.size(), device=device).fill_(0)).sum()
         #     fake_loss.backward()
@@ -472,21 +486,23 @@ if __name__ == '__main__':
                          help='url used to set up distributed training')
     parser.add_argument('--dist-backend', default='gloo', type=str,
                             help='distributed backend')
+    parser.add_argument('--hostname', default='127.0.0.1', type=str,
+                            help='hostname for rank 0')
     args = parser.parse_args()
     print(args)
 
-    if args.dist_url == "env://" and args.world_size == -1:
-        args.world_size = int(os.environ.get("PMI_SIZE", -1))
-        if args.world_size == -1: args.world_size = int(os.environ["WORLD_SIZE"])
+    # if args.dist_url == "env://" and args.world_size == -1:
+    #     args.world_size = int(os.environ.get("PMI_SIZE", -1))
+    #     if args.world_size == -1: args.world_size = int(os.environ["WORLD_SIZE"])
 
-    args.distributed = args.world_size > 1
-    if args.distributed:
-        args.rank = int(os.environ.get("PMI_RANK", -1))
-        if args.rank == -1: args.rank = int(os.environ["RANK"])        
-        dist.init_process_group(backend=args.dist_backend, init_method=args.dist_url,
-                                world_size=args.world_size, rank=args.rank)
+    # args.distributed = args.world_size > 1
+    # if args.distributed:
+    #     args.rank = int(os.environ.get("PMI_RANK", -1))
+    #     if args.rank == -1: args.rank = int(os.environ["RANK"])        
+    #     dist.init_process_group(backend=args.dist_backend, init_method=args.dist_url,
+    #                             world_size=args.world_size, rank=args.rank)
 
-    print("Rank: ", args.rank ," World_size: ", args.world_size)
+    # print("Rank: ", args.rank ," World_size: ", args.world_size)
 
     # rank = args.rank
     # size = args.world_size
