@@ -23,48 +23,6 @@ from sageconv import SAGEConvAgg, SAGEConvMLP
 
 import socket
 
-
-def broad_func(self, graph, ampbyp, agg, inputs):
-  node_count = graph.number_of_nodes()
-#   print('---------',inputs.shape[1], ampbyp)
-  n_per_proc = math.ceil(float(node_count) / (self.size / self.replication))
-  z_loc = torch.FloatTensor(ampbyp[0].size(0), inputs.size(1)).fill_(0)
-  inputs_recv = torch.FloatTensor(n_per_proc, inputs.size(1)).fill_(0)
-  
- 
-  rank_c = self.rank // self.replication
-  rank_col = self.rank % self.replication
-
-  stages = self.size // (self.replication ** 2)
-
-  if rank_col == self.replication - 1:
-    # stages = rank_c - (self.replication - 1) * stages
-    stages = (self.size // self.replication) - (self.replication - 1) * stages
-
-  
-  chunk = self.size // (self.replication ** 2)
-
-  for i in range(stages):
-    q = (rank_col * chunk)*self.replication + i*self.replication + rank_col
-    q_c = (rank_col * chunk) + i
-
-    if q == self.rank:
-      inputs_recv = inputs.clone()
-    elif q_c == self.size // self.replication - 1:
-      inputs_recv = torch.FloatTensor(am_pbyp[q_c].size(1), inputs.size(1)).fill_(0)
-
-    inputs_recv = inputs_recv.contiguous()
-    # print("==================inp ",inputs_recv.shape)
-    # print("========= col ", q , self.col_groups[rank_col])
-    dist.broadcast(inputs_recv, src=q, group=self.col_groups[rank_col])
-    
-    z_loc = agg(graph, inputs_recv)
-  
-  z_loc = z_loc.contiguous()
-  dist.all_reduce(z_loc, op=dist.reduce_op.SUM, group=self.row_groups[rank_c])
-
-  return z_loc
-
 def get_proc_groups(rank, size, replication):
     rank_c = rank // replication
      
@@ -85,47 +43,6 @@ def get_proc_groups(rank, size, replication):
         col_groups.append(dist.new_group(col_procs[i]))
 
     return row_groups, col_groups
-
-class GraphSAGEFn(torch.autograd.Function):
-  @staticmethod
-  def forward(ctx, self, graph, ampbyp, agg, mlp, inputs):
-
-    z = broad_func(self, graph, ampbyp, agg, inputs)
-    z = mlp(graph, z, z)
-
-    ctx.save_for_backward(inputs)
-    ctx.ampbyp = ampbyp
-    ctx.graph = graph
-    ctx.self = self
-    ctx.agg = agg
-    ctx.mlp = mlp
-    ctx.z = z
-
-    return z
-
-  @staticmethod
-  def backward(ctx, grad_output):
-    self = ctx.self 
-    graph = ctx.graph
-    agg = ctx.agg
-    mlp = ctx.mlp
-    z = ctx.z
-    ampbyp = ctx.ampbyp
-    inputs = ctx.saved_tensors
-    
-    # t_grad_input, grad_weight, grad_bias = mlp(grad_output)
-    # dz = broad_func(self, graph, ampbyp, agg, t_grad_input)
-    
-    # t_grad_input = mlp(graph, grad_output, grad_output)
-    # grad_output = mlp(graph, grad_output, grad_output)
-    weight = mlp.fc_neigh.weight.data
-    bias = mlp.fc_neigh.bias
-    # grad_output = torch.addmm(bias, grad_output, weight)
-    grad_output = torch.mm(grad_output, weight)
-    dz = broad_func(self, graph, ampbyp, agg, grad_output)
-
-    return None, None, None, None, None, dz
-
 
 class GraphSAGE(nn.Module):
   def __init__(self, in_feats, n_hidden, n_classes, n_layers, activation, dropout, aggregator_type, rank, size, replication, group, row_groups, col_groups):
@@ -160,7 +77,8 @@ class GraphSAGE(nn.Module):
   def forward(self, graph, inputs, ampbyp):
     h = self.dropout(inputs)
     for l, (agg_layer, mlp_layer) in enumerate(zip(self.agg_layers, self.mlp_layers)):
-      h = GraphSAGEFn.apply(self, graph, ampbyp, agg_layer, mlp_layer, h)
+      z = agg_layer(self, graph, ampbyp, h)
+      h = mlp_layer(graph, z, z)
     return h
 
 # Normalize all elements according to KW's normalization rule
@@ -329,7 +247,7 @@ def main(args):
     if "SLURM_NTASKS" in os.environ.keys():
         os.environ["WORLD_SIZE"] = os.environ["SLURM_NTASKS"]
 
-    print(f"hostname: {socket.gethostname()}", flush=True)
+    print(f"hostname: {socket.gethostname()} rank: {os.environ['RANK']}", flush=True)
     os.environ["MASTER_ADDR"] = args.hostname 
     os.environ["MASTER_PORT"] = "1234"
 
@@ -399,6 +317,7 @@ def main(args):
     if cuda:
         model.cuda()
 
+    print(f"is cuda: {next(model.parameters()).is_cuda}:")
     # use optimizer
     optimizer = torch.optim.Adam(model.parameters(), lr=args.lr, weight_decay=args.weight_decay)
 
@@ -435,6 +354,7 @@ def main(args):
         # loss.requires_grad = True
         optimizer.zero_grad()
         loss.backward()
+        
         # else:
         #     fake_loss = (logits * torch.FloatTensor(logits.size(), device=device).fill_(0)).sum()
         #     fake_loss.backward()
