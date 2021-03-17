@@ -255,7 +255,8 @@ def main(args):
     #                             world_size=args.world_size, rank=args.rank) 
 
     # dist.init_process_group(backend='mpi')
-    dist.init_process_group(backend='gloo')
+    # dist.init_process_group(backend='gloo')
+    dist.init_process_group(backend=args.dist_backend)
     rank = dist.get_rank()
     size = dist.get_world_size()
     print(f"hostname: {socket.gethostname()} rank: {rank} size: {size}")
@@ -290,12 +291,13 @@ def main(args):
     # print("------------------->",ampbyp)
     # Convert COO back to DGLGraph
     # Uses hardcoded types, doesn't include all the metadata in original g
-    g_loc = dgl.heterograph({("_N", "_N", "_E"): (g_loc._indices()[0], g_loc._indices()[1])}) 
-    # for i in range(len(ampbyp)):
-    #     ampbyp[i] = dgl.heterograph({("_N", "_N", "_E"): (ampbyp[i]._indices()[0], ampbyp[i]._indices()[1])})
+    # g_loc = dgl.heterograph({("_N", "_N", "_E"): (g_loc._indices()[0], g_loc._indices()[1])}) 
 
     for i in range(len(ampbyp)):
         ampbyp[i] = ampbyp[i].t().coalesce().to(device)
+        print(f"i: {i} ampbyp.size: {ampbyp[i].size()}")
+        # ampbyp[i] = dgl.heterograph({("_N", "_N", "_E"): (ampbyp[i]._indices()[0], ampbyp[i]._indices()[1])})
+        # ampbyp[i] = dgl.graph((ampbyp[i]._indices()[0], ampbyp[i]._indices()[1]))
         # ampbyp[i] = dgl.heterograph({am_pbyp[i]})
 
     features.requires_grad = True
@@ -328,7 +330,8 @@ def main(args):
         if epoch >= 3:
             t0 = time.time()
         # forward
-        logits = model(g, features, ampbyp)
+        # logits = model(g, features, ampbyp)
+        logits = model(g_loc, features_loc, ampbyp)
         
         rank_c = rank // args.replication
         var = logits.size(0)
@@ -347,7 +350,7 @@ def main(args):
          
         # if list(label_rank[rank_train_mask].size())[0] > 0:
         # loss = F.cross_entropy(logits[rank_train_mask], label_rank[rank_train_mask]) 
-        # for param in model.parameters(): param.requires_grad = True 
+        # for param in model.parameters(): param.requires_grad = True 
         # for param in model.parameters(): param.requires_grad=True
         loss = F.cross_entropy(logits[train_nids], label_rank[train_nids]) 
         # loss = Variable(loss, requires_grad = True)
